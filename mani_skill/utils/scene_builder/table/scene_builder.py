@@ -49,7 +49,7 @@ class TableSceneBuilder(SceneBuilder):
         self.table = table
         self.scene_objects: List[sapien.Entity] = [self.table, self.ground]
 
-    def initialize(self, env_idx: torch.Tensor):
+    def initialize(self, env_idx: torch.Tensor, custom_robot_pose: list = None, custom_robot_q: list = None):
         # table_height = 0.9196429
         b = len(env_idx)
         self.table.set_pose(
@@ -77,7 +77,12 @@ class TableSceneBuilder(SceneBuilder):
             )
             qpos[:, -2:] = 0.04
             self.env.agent.reset(qpos)
-            self.env.agent.robot.set_pose(sapien.Pose([-0.615, 0, 0]))
+            robot_pose = sapien.Pose([-0.615, 0, 0])
+            if custom_robot_pose is not None:
+                robot_pose.p = custom_robot_pose
+            if custom_robot_q is not None:
+                robot_pose.q = custom_robot_q
+            self.env.agent.robot.set_pose(robot_pose)
         elif self.env.robot_uids == "panda_wristcam":
             # fmt: off
             qpos = np.array(
