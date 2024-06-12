@@ -258,6 +258,7 @@ if __name__ == "__main__":
             failures = []
             for _ in range(args.num_eval_steps):
                 with torch.no_grad():
+                    # breakpoint()
                     eval_obs, _, eval_terminations, eval_truncations, eval_infos = eval_envs.step(agent.get_action(eval_obs, deterministic=True))
                     if "final_info" in eval_infos:
                         mask = eval_infos["_final_info"]
@@ -267,8 +268,9 @@ if __name__ == "__main__":
                             successes.append(eval_infos["final_info"]["success"][mask].cpu().numpy())
                         if "fail" in eval_infos:
                             failures.append(eval_infos["final_info"]["fail"][mask].cpu().numpy())
-            returns = np.concatenate(returns)
-            eps_lens = np.concatenate(eps_lens)
+            # breakpoint()
+            returns = np.concatenate(returns) if len(returns) > 0 else np.array([0.])
+            eps_lens = np.concatenate(eps_lens) if len(eps_lens) > 0 else np.array([0.])
             print(f"Evaluated {args.num_eval_steps * args.num_eval_envs} steps resulting in {len(eps_lens)} episodes")
             if len(successes) > 0:
                 successes = np.concatenate(successes)
