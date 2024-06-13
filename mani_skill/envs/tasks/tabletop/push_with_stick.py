@@ -18,7 +18,7 @@ from mani_skill.utils.structs.pose import Pose
 from mani_skill.utils.geometry.rotation_conversions import quaternion_apply, quaternion_invert
 
 
-@register_env("PushWithStick-v1", max_episode_steps=100) # TODO: increase env steps
+@register_env("PushWithStick-v1", max_episode_steps=100) # TRIED - reduce steps to 50 - down to 0.7-0.8 perf
 class PushWithStickEnv(BaseEnv):
     SUPPORTED_ROBOTS = ["panda"]
     agent: Panda #Union[Panda, Xmate3Robotiq, Fetch]
@@ -26,6 +26,7 @@ class PushWithStickEnv(BaseEnv):
     cube_half_size = 0.02
     moving_cube_thresh = 0.10# 0.055(default), 0.1(loose), 0.15(looser) # stick diagonal len + cube diagonal len = 0.02*sqrt(2) + 0.02*sqrt(2) ~= 0.0567
     goal_thresh = 0.025
+    ignore_dir_by_goal_thresh = 0.04 # don't do goal dir reward when this close (just set dir rew = 1)
 
     def __init__(self, *args, robot_uids="panda", robot_init_qpos_noise=0.02, **kwargs):
         self.robot_init_qpos_noise = robot_init_qpos_noise
@@ -78,20 +79,22 @@ class PushWithStickEnv(BaseEnv):
             # stick_xyz[:, 1] -= 0.6 # Move closer to robot
             stick_xyz[:, 2] = self.stick_half_sizes[0]
             # TODO: remove later, but make position static for now
-            stick_qs = randomization.random_quaternions(b, lock_x=True, lock_y=True, lock_z=False, bounds=[-np.pi/4, np.pi/4])
+            stick_qs = randomization.random_quaternions(b, lock_x=True, lock_y=True, lock_z=True)
+            # stick_qs = randomization.random_quaternions(b, lock_x=True, lock_y=True, lock_z=False, bounds=[-np.pi/4, np.pi/4]) # TRIED - slower convergence, but still works!
             self.stick.set_pose(Pose.create_from_pq(stick_xyz, stick_qs))
 
             cube_xyz = torch.zeros((b, 3))
             cube_xyz[:, :2] = torch.rand((b, 2)) * 0.2 - 0.1
-            cube_xyz[:, 1] += 0.05 # Move farther from robot
+            cube_xyz[:, 1] += 0.05 # Move farther from robot # [-.05, .15]
             cube_xyz[:, 2] = self.cube_half_size
             qs = randomization.random_quaternions(b, lock_x=True, lock_y=True)
             self.cube.set_pose(Pose.create_from_pq(cube_xyz, qs))
 
             goal_xyz = torch.zeros((b, 3))
-            # goal_xyz[:, :2] = torch.rand((b, 2)) * 0.2 - 0.1# [-0.1, 0.1]
-            goal_xyz[:, 0] = cube_xyz[:, 0] + (torch.randint(0, 2, (b,))*2 - 1) * (torch.rand((b,))*.1 + 0.1) # put goal x in [-.2, -.1] U [.1, .2] relative to cube
-            goal_xyz[:, 1] = cube_xyz[:, 1] + torch.rand(b) * 0.1 # dont put goal behind cube b/c it might be hard for now
+            goal_xyz[:, :2] = torch.rand((b, 2)) * 0.2 - 0.1# [-0.1, 0.1]
+            # goal_xyz[:, 0] = cube_xyz[:, 0] + (torch.randint(0, 2, (b,))*2 - 1) * (torch.rand((b,))*.1 + 0.1) # put goal x in [-.2, -.1] U [.1, .2] relative to cube
+            goal_xyz[:, 1] = cube_xyz[:, 1] + torch.rand(b) * 0.1 # dont put goal behind cube b/c it might be hard for now # [-.05, .25]
+            goal_xyz[goal_xyz[:, 1] > 0.18, 1] = 0.18 # maximum y coord [-.05, .18] # TRIED (made it easier - MUCH better performance) # TRYING again seed 2
             goal_xyz[:, 2] = cube_xyz[:, 2]
             self.goal_site.set_pose(Pose.create_from_pq(goal_xyz))
 
@@ -108,18 +111,20 @@ class PushWithStickEnv(BaseEnv):
                 tcp_to_obj_pos=self.cube.pose.p - self.agent.tcp.pose.p,
                 obj_to_goal_pos=self.goal_site.pose.p - self.cube.pose.p,
                 stick_pose=self.stick.pose.raw_pose,
-                tcp_to_stick_pos=self.rel_dist_to_stick(self.agent.tcp.pose, self.stick.pose), # self.stick.pose.p - self.agent.tcp.pose.p
-                obj_to_stick_pos=self.rel_dist_to_stick(self.cube.pose, self.stick.pose) # self.stick.pose.p - self.cube.pose.p 
+                tcp_to_stick_pos=self.stick.pose.p - self.agent.tcp.pose.p, #self.rel_dist_to_stick(self.agent.tcp.pose, self.stick.pose),
+                obj_to_stick_pos=self.stick.pose.p - self.cube.pose.p #self.rel_dist_to_stick(self.cube.pose, self.stick.pose) # 
             )
         return obs
     
-    def rel_dist_to_stick(self, obj_pose, stick_pose):
+    def rel_dist_to_stick(self, obj_pose, stick_pose, zero_stick_length = True):
         # Move to stick coordinates
         inv_q = quaternion_invert(stick_pose.q)
         displacement_to_stick = quaternion_apply(inv_q, obj_pose.p) - quaternion_apply(inv_q, stick_pose.p)
         # if y value > stick len: subtract stick len
         # if y value < stick len and > -stick len, set to 0
         # if y value < -stick len, add stick len
+        if not zero_stick_length:
+            return displacement_to_stick
         assert self.stick_half_sizes[1] == 0.30
         stick_len = self.stick_half_sizes[1]
         displacement_to_stick[torch.abs(displacement_to_stick[:, 1]) <= stick_len, 1] = 0
@@ -143,6 +148,46 @@ class PushWithStickEnv(BaseEnv):
             displacement_to_stick, axis=1
         )
         return to_stick_dist
+    
+    def goal_heading_dist(self, stick_pose, cube_pose, goal_pose):
+        # new idea: 
+        # compare relative vector from stick to cube to rel vector from stick to goal
+        # They should be in roughly the same direction (use normalized dot product?)
+        # copied code from rel_dist_to_stick to make it slightly more efficient to compute
+        inv_q = quaternion_invert(stick_pose.q)
+        stick_to_cube_actual = quaternion_apply(inv_q, cube_pose.p) - quaternion_apply(inv_q, stick_pose.p)
+
+        stick_to_cube = torch.clone(stick_to_cube_actual)
+        stick_len = self.stick_half_sizes[1]
+        stick_to_cube[torch.abs(stick_to_cube[:, 1]) <= stick_len, 1] = 0
+        stick_to_cube[stick_to_cube[:, 1] > stick_len, 1] -= stick_len
+        stick_to_cube[stick_to_cube[:, 1] < -stick_len, 1] += stick_len
+
+        stick_to_goal_actual = self.rel_dist_to_stick(goal_pose, stick_pose, zero_stick_length=False)
+
+        # print("stick_to_cube", stick_to_cube)
+        # print("stick_to_cube_actual", stick_to_cube_actual)
+        # print("stick_to_goal_actual", stick_to_goal_actual)
+        cube_to_goal_in_stick = stick_to_goal_actual - stick_to_cube_actual
+        # print("cube_to_goal_in_stick", cube_to_goal_in_stick)
+        dot = (stick_to_cube * cube_to_goal_in_stick).sum(dim=1)
+        normal_dot = dot/torch.norm(stick_to_cube, dim=1)/torch.norm(cube_to_goal_in_stick, dim=1)
+        # print("norm dot vector", normal_dot)
+        return (torch.sin(torch.pi/2*normal_dot) + 1) / 2 # [-1, 1] -> further smoothed [0, 1]
+
+        # # Move to cube coordinates
+        # inv_q = quaternion_invert(cube_pose.q)
+        # stick_to_cube = quaternion_apply(inv_q, stick_pose.p) - quaternion_apply(inv_q, cube_pose.p)
+        # print(stick_to_cube)
+        # # rotate above points such that +x is towards goal point
+        # # Then add reward for y close to 0 (stick directly behind cube)
+
+        # angle = torch.zeros((len(stick_pose), 3)).to(stick_pose.p.device)
+        # angle[:, 2] = torch.atan2(goal_pose.p[:, 1] - cube_pose.p[:, 1], goal_pose.p[:, 0] - cube_pose.p[:, 0]) # [-pi, pi]
+        # rot_z_mat = euler_angles_to_matrix(angle, 'XYZ')
+        # print(angle/np.pi*180)
+        # print(rot_z_mat.shape)
+        # print(torch.bmm(stick_to_cube.unsqueeze(1), torch.transpose(rot_z_mat, 1, 2)).view(-1, 3))
 
 
     def evaluate(self):
@@ -162,7 +207,6 @@ class PushWithStickEnv(BaseEnv):
         }
 
     def compute_dense_reward(self, obs: Any, action: torch.Tensor, info: Dict):
-        # Reward for distance to stick (TODO: any part of stick, not neccessarily the center)
         # print("tcp pose p:", self.agent.tcp.pose.p)
         # print("tcp pose q:", self.agent.tcp.pose.q)
         # print("stick pose p:", self.stick.pose.p)
@@ -175,20 +219,48 @@ class PushWithStickEnv(BaseEnv):
         reaching_reward = 1 - torch.tanh(5 * tcp_to_stick_dist)
         # print("reaching_reward", reaching_reward)
         reward = reaching_reward
+        # print("reaching_reward", reaching_reward)
 
         # Reward for holding stick
         is_grasped = info["is_grasped"]
         reward += is_grasped
+        # print("is_grasped", is_grasped)
 
-        # Reward for stick being close to cube
-        # TODO: implement (should be distance to any part of stick) 
-        #                 (maybe just x dimension? but then height z wouldn't be considered. Also if the stick rotates 90 deg that breaks)
-        cube_to_stick_dist = self.distance_to_stick(self.cube.pose, self.stick.pose)
-        # print("cube_to_stick_dist", cube_to_stick_dist)
-        # pushing_reward = 1 - torch.tanh(5 * cube_to_stick_dist)
-        pushing_reward = cube_to_stick_dist <= self.moving_cube_thresh #loose: 0.1, looser: 0.15
-        # print("pushing_reward", pushing_reward * is_grasped)
-        reward += pushing_reward * is_grasped
+        if is_grasped.any():
+            # Reward for stick being close to cube
+            cube_to_stick_dist = self.distance_to_stick(self.cube.pose, self.stick.pose)
+            # print("cube_to_stick_dist", cube_to_stick_dist)
+            # pushing_reward = 1 - torch.tanh(5 * cube_to_stick_dist)
+            pushing_reward = cube_to_stick_dist <= self.moving_cube_thresh #loose: 0.1, looser: 0.15
+            # print("pushing_reward", pushing_reward * is_grasped)
+            reward += pushing_reward * is_grasped
+            # print("pushing_reward", pushing_reward)
+
+            if info["is_pushing"].any():
+                # Reward for getting cube closer to goal
+                obj_to_goal_dist = torch.linalg.norm(
+                    self.goal_site.pose.p - self.cube.pose.p, axis=1
+                )
+                place_reward = 1*(1 - torch.tanh(5 * obj_to_goal_dist))
+                reward += place_reward * is_grasped * info["is_pushing"]
+                # print("place_reward", place_reward)
+
+                # Reward for stick being on correct side of cube to push towards goal
+                dot_reward = self.goal_heading_dist(self.stick.pose, self.cube.pose, self.goal_site.pose)
+                dot_reward[info["is_obj_placed"]] = 1.0
+                dot_reward[obj_to_goal_dist <= self.ignore_dir_by_goal_thresh] = 1.0 # TRIED REMOVE (seems good / no change) # TRYING AGAIN seed 2
+                reward += dot_reward * is_grasped * info["is_pushing"]
+                # print("dot_reward", dot_reward, info["is_obj_placed"])
+
+        # Reward for not moving when object placed
+        static_reward = 1 - torch.tanh(
+            5 * torch.linalg.norm(self.agent.robot.get_qvel()[..., :-2], axis=1)
+        )
+        reward += static_reward * info["is_obj_placed"]
+        # print("static_reward", static_reward, info["is_obj_placed"])
+
+        reward[info["success"]] = 7
+        return reward
 
         # More reward ideas:
         # reward for stick being on correct side of cube (opposite side from goal direction, viewed from top down)
@@ -200,24 +272,24 @@ class PushWithStickEnv(BaseEnv):
 
         # debug cube_to_stick: can robot stop pushing from behind and start pushing from right without losing reward? 
             # need to manually setup scenario in jupyter notebook
-
-        # Reward for getting cube closer to goal
-        obj_to_goal_dist = torch.linalg.norm(
-            self.goal_site.pose.p - self.cube.pose.p, axis=1
-        )
-        place_reward = (1 - torch.tanh(5 * obj_to_goal_dist))
-        reward += place_reward * is_grasped * info["is_pushing"]
-
-        # Reward for not moving when object placed
-        static_reward = 1 - torch.tanh(
-            5 * torch.linalg.norm(self.agent.robot.get_qvel()[..., :-2], axis=1)
-        )
-        reward += static_reward * info["is_obj_placed"]
-
-        reward[info["success"]] = 6
-        return reward
+        
+        # 90% SUCCESS WOOOOOOOOO
+        # maybe dont have cube/goal spawn so far away
+        # Randomize stick rot?
+        # Reduce threshold for heading reward?
+        
+        # Experiments to try:
+        # repeat 1x rew on 1-2 other seeds  (Tried - seed 2, 3 works!)
+        # repeat 2x rew on 1-2 other seeds
+        # move cube/goal closer -- repeat 1-2x  (TRIED - much better perfm, dont see reach limitation of robot)
+        # rotate stick +- 45 deg -- repeat 1-2x (TRIED - slower convergence, still works. issue with prongs pushing stick. also robot tries to pick up stick 
+        #   and hold it forward, sometimes inadvertenly hitting the cube way too fast and moving it too far away)
+        # episode len? (TRIED - 50 steps - much worse - 0.8 -- it seems the reduced time made it harder for the robot to learn how to pickup a stick properly, 
+        #   sometimes it tries to push it with its prongs if it failed to get it the first attempt)
+        # reduce/no heading threshold?  (TRIED - seems better / no change, seems to solve issue of idling cube by goal)
+        # combined - move closer, no head threshold
 
     def compute_normalized_dense_reward(
         self, obs: Any, action: torch.Tensor, info: Dict
     ):
-        return self.compute_dense_reward(obs=obs, action=action, info=info) / 6
+        return self.compute_dense_reward(obs=obs, action=action, info=info) / 7
