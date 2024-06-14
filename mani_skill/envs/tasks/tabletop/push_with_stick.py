@@ -80,7 +80,7 @@ class PushWithStickEnv(BaseEnv):
             stick_xyz[:, 2] = self.stick_half_sizes[0]
             # TODO: remove later, but make position static for now
             stick_qs = randomization.random_quaternions(b, lock_x=True, lock_y=True, lock_z=True)
-            # stick_qs = randomization.random_quaternions(b, lock_x=True, lock_y=True, lock_z=False, bounds=[-np.pi/4, np.pi/4]) # TRIED - slower convergence, but still works!
+            # stick_qs = randomization.random_quaternions(b, lock_x=True, lock_y=True, lock_z=False, bounds=[-np.pi/4, np.pi/4]) # TRIED - slower convergence, but still works! TRYING AGAIN
             self.stick.set_pose(Pose.create_from_pq(stick_xyz, stick_qs))
 
             cube_xyz = torch.zeros((b, 3))
@@ -94,7 +94,7 @@ class PushWithStickEnv(BaseEnv):
             goal_xyz[:, :2] = torch.rand((b, 2)) * 0.2 - 0.1# [-0.1, 0.1]
             # goal_xyz[:, 0] = cube_xyz[:, 0] + (torch.randint(0, 2, (b,))*2 - 1) * (torch.rand((b,))*.1 + 0.1) # put goal x in [-.2, -.1] U [.1, .2] relative to cube
             goal_xyz[:, 1] = cube_xyz[:, 1] + torch.rand(b) * 0.1 # dont put goal behind cube b/c it might be hard for now # [-.05, .25]
-            goal_xyz[goal_xyz[:, 1] > 0.18, 1] = 0.18 # maximum y coord [-.05, .18] # TRIED (made it easier - MUCH better performance) # TRYING again seed 2
+            # goal_xyz[goal_xyz[:, 1] > 0.18, 1] = 0.18 # maximum y coord [-.05, .18] # TRIED (made it easier - MUCH better performance) # TRIED again seed 2
             goal_xyz[:, 2] = cube_xyz[:, 2]
             self.goal_site.set_pose(Pose.create_from_pq(goal_xyz))
 
@@ -108,7 +108,7 @@ class PushWithStickEnv(BaseEnv):
         if "state" in self.obs_mode:
             obs.update(
                 obj_pose=self.cube.pose.raw_pose,
-                tcp_to_obj_pos=self.cube.pose.p - self.agent.tcp.pose.p,
+                tcp_to_obj_pos=self.cube.pose.p - self.agent.tcp.pose.p, # maybe can remove this obs
                 obj_to_goal_pos=self.goal_site.pose.p - self.cube.pose.p,
                 stick_pose=self.stick.pose.raw_pose,
                 tcp_to_stick_pos=self.stick.pose.p - self.agent.tcp.pose.p, #self.rel_dist_to_stick(self.agent.tcp.pose, self.stick.pose),
@@ -241,14 +241,14 @@ class PushWithStickEnv(BaseEnv):
                 obj_to_goal_dist = torch.linalg.norm(
                     self.goal_site.pose.p - self.cube.pose.p, axis=1
                 )
-                place_reward = 1*(1 - torch.tanh(5 * obj_to_goal_dist))
+                place_reward = 1*(1 - torch.tanh(5 * obj_to_goal_dist)) 
                 reward += place_reward * is_grasped * info["is_pushing"]
                 # print("place_reward", place_reward)
 
                 # Reward for stick being on correct side of cube to push towards goal
                 dot_reward = self.goal_heading_dist(self.stick.pose, self.cube.pose, self.goal_site.pose)
                 dot_reward[info["is_obj_placed"]] = 1.0
-                dot_reward[obj_to_goal_dist <= self.ignore_dir_by_goal_thresh] = 1.0 # TRIED REMOVE (seems good / no change) # TRYING AGAIN seed 2
+                dot_reward[obj_to_goal_dist <= self.ignore_dir_by_goal_thresh] = 1.0 # TRIED REMOVE (seems good / no change) # TRIED AGAIN seed 2
                 reward += dot_reward * is_grasped * info["is_pushing"]
                 # print("dot_reward", dot_reward, info["is_obj_placed"])
 
@@ -279,14 +279,15 @@ class PushWithStickEnv(BaseEnv):
         # Reduce threshold for heading reward?
         
         # Experiments to try:
-        # repeat 1x rew on 1-2 other seeds  (Tried - seed 2, 3 works!)
-        # repeat 2x rew on 1-2 other seeds
-        # move cube/goal closer -- repeat 1-2x  (TRIED - much better perfm, dont see reach limitation of robot)
-        # rotate stick +- 45 deg -- repeat 1-2x (TRIED - slower convergence, still works. issue with prongs pushing stick. also robot tries to pick up stick 
+        # repeat 1x rew on 2 other seeds  (Tried - seed 2, 3 works!)
+        # repeat 2x rew on 1-2 other seeds -- didn't do
+        # move cube/goal closer -- repeated 2x  (TRIED - much better perfm, dont see reach limitation of robot)
+        # rotate stick +- 45 deg -- repeat 2x (TRIED - slower convergence, still works. issue with prongs pushing stick. also robot tries to pick up stick  TRYING NOW AGAIN
         #   and hold it forward, sometimes inadvertenly hitting the cube way too fast and moving it too far away)
         # episode len? (TRIED - 50 steps - much worse - 0.8 -- it seems the reduced time made it harder for the robot to learn how to pickup a stick properly, 
         #   sometimes it tries to push it with its prongs if it failed to get it the first attempt)
-        # reduce/no heading threshold?  (TRIED - seems better / no change, seems to solve issue of idling cube by goal)
+        # reduce/no heading threshold?  repeated 2x(TRIED - seems better / no change, seems to solve issue of idling cube by goal)
+        # remove tcp->cube obs
         # combined - move closer, no head threshold
 
     def compute_normalized_dense_reward(
